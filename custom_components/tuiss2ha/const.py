@@ -10,6 +10,29 @@ SPEED_CONTROL_SUPPORTED_MODELS = ["TS5200","TS5101","TS5001","TS2600"]
 
 TIMEOUT_SECONDS = 120
 TRAVERSAL_UPDATE_THRESHOLD = 5
+
+# Wall-clock budget (seconds) for establishing a BLE connection before giving up.
+# These blinds are "sleepy" peripherals: the ESP32 proxy can only complete a GATT
+# connection during the blind's brief connectable window, so we retry within a bounded
+# budget rather than hanging HA for minutes. See DIAGNOSIS notes.
+CONNECT_BUDGET_SECONDS = 90
+# Hard cap for a single connection attempt. establish_connection can otherwise block for
+# 40s+ per attempt (≈20s connect timeout + ≈20s disconnect-cleanup) and its internal
+# retries stack these into multi-minute hangs. We do ONE establish attempt per call and
+# cap it here, then let attempt_connection re-home to a fresh proxy and try again within
+# the overall CONNECT_BUDGET_SECONDS.
+PER_ATTEMPT_CONNECT_TIMEOUT = 45
+# Max time to wait for a clean BLE disconnect before force-dropping the client, so a
+# stuck disconnect can't leave a zombie connection that sabotages the next attempt.
+DISCONNECT_TIMEOUT_SECONDS = 8
+
+# Keep-awake (persistent connection). These sleepy motors accept only ONE BLE connection and
+# the ESP32 proxies can't reliably wake them on demand, so for chosen blinds HA grabs and HOLDS
+# the connection (exactly like the phone app) to keep the motor awake and instantly controllable.
+# Scoped by MAC so it can ONLY ever affect the listed blind(s) — never the others.
+KEEP_AWAKE_HOSTS = ["C0:16:2C:5E:66:A0"]  # guinea pig: Living Room Blind 10 (Patio Right)
+KEEP_AWAKE_RETRY_SECONDS = 240   # gentle re-grab interval while the blind is unreachable
+KEEP_AWAKE_HOLD_POLL_SECONDS = 15  # how often the hold loop checks the connection is alive
 BLIND_NOTIFY_CHARACTERISTIC = "00010304-0405-0607-0809-0a0b0c0d1910"
 CONNECTION_MESSAGE = "ff03030303787878787878"
 INITIALIZATION_MESSAGE = "ff78ea41d10301"

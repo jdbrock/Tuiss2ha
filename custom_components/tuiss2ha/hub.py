@@ -33,6 +33,12 @@ from .const import (
     ConnectionTimeout,
     NoConnectableBluetoothAdapter,
     TIMEOUT_SECONDS,
+    CONNECT_BUDGET_SECONDS,
+    PER_ATTEMPT_CONNECT_TIMEOUT,
+    DISCONNECT_TIMEOUT_SECONDS,
+    KEEP_AWAKE_HOSTS,
+    KEEP_AWAKE_RETRY_SECONDS,
+    KEEP_AWAKE_HOLD_POLL_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -106,6 +112,17 @@ class TuissBlind:
         self.timers = {}
         self._store = Store(self.hub._hass, 1, f"tuiss2ha_{self.host.replace(':', '').lower()}_schedules")
         self._limits_heartbeat_task: asyncio.Task | None = None
+        # Serializes connection establishment so keep-awake and move commands never try to
+        # connect at the same time (double-connect clashes were causing ESP_GATT_CONN_CANCEL).
+        self._conn_lock = asyncio.Lock()
+        # Keep-awake mode: HOLD the connection open for chosen blinds (see KEEP_AWAKE_HOSTS).
+        self._keep_awake = self.host in KEEP_AWAKE_HOSTS
+        self._keep_awake_task: asyncio.Task | None = None
+        # Notify subscription is created ONCE per connection and reused (the app does the same).
+        # Re-subscribing on a held keep-awake connection hangs, so every operation just sets
+        # _response_handler and calls _ensure_notify(); responses are dispatched to the handler.
+        self._notify_active = False
+        self._response_handler = None
 
 
     @property
@@ -176,31 +193,53 @@ class TuissBlind:
                 f"{self.name}: Cannot find the device. Check your bluetooth adapters and proxies"
             )
 
-        retry_count = 1
-        while retry_count <= self._restart_attempts:
+        # Retry within a bounded wall-clock budget. Each attempt re-fetches the freshest
+        # connectable BLEDevice (inside connect()) so retries re-home to whichever proxy
+        # hears the blind best right now - important for these sleepy peripherals whose
+        # best proxy changes between adverts. Bounded so HA never hangs for minutes.
+        loop = self.hub._hass.loop
+        deadline = loop.time() + CONNECT_BUDGET_SECONDS
+        attempt = 0
+        backoff = 1.0
+        while True:
+            attempt += 1
             _LOGGER.debug(
-                "%s %s: Attempting Connection to blind. Retry count: %d of %d",
+                "%s %s: Attempting connection (attempt %d, %.0fs left of %ds budget)",
                 self.name,
                 self._ble_device,
-                retry_count,
-                self._restart_attempts
+                attempt,
+                max(0.0, deadline - loop.time()),
+                CONNECT_BUDGET_SECONDS,
             )
-            await self.connect()
+            # Hard-cap each attempt so one blocked establish_connection can't blow the
+            # whole budget. On timeout we drop any half-open client and re-home next loop.
+            per_attempt = min(PER_ATTEMPT_CONNECT_TIMEOUT, max(1.0, deadline - loop.time()))
+            try:
+                await asyncio.wait_for(self.connect(), timeout=per_attempt)
+            except asyncio.TimeoutError:
+                _LOGGER.debug(
+                    "%s: Connection attempt %d exceeded %.0fs; re-homing", self.name, attempt, per_attempt
+                )
+                self._last_connection_error = f"connect attempt timed out after {per_attempt:.0f}s"
+                self._client = None
 
             # If the client is connected, return early
             if self._client and self._client.is_connected:
+                _LOGGER.debug("%s: Connected after %d attempt(s)", self.name, attempt)
                 return
 
-            retry_count += 1
-            if retry_count <= self._restart_attempts:
-                await asyncio.sleep(2)
+            if loop.time() >= deadline:
+                break
+            await asyncio.sleep(min(backoff, max(0.1, deadline - loop.time())))
+            backoff = min(backoff * 1.5, 5.0)
 
-        # If we reach here, we have exceeded max retries - log the actual error at ERROR so it's visible
+        # Budget exhausted without connecting - log the actual error at ERROR so it's visible
         last_err = self._last_connection_error or "unknown (no error captured)"
         _LOGGER.error(
-            "%s: Connection failed after %d attempts. Last error: %s",
+            "%s: Connection failed after %d attempt(s) within %ds budget. Last error: %s",
             self.name,
-            self._restart_attempts,
+            attempt,
+            CONNECT_BUDGET_SECONDS,
             last_err,
         )
         # Give a clear error when user has only passive Bluetooth (e.g. Shelly)
@@ -212,23 +251,44 @@ class TuissBlind:
                 "No connectable Bluetooth adapter. Shelly and similar devices are passive-only. "
                 "You need an ESPHome Bluetooth proxy or a USB Bluetooth adapter to control Tuiss blinds."
             )
-        raise ConnectionTimeout(f"{self.name}: Connection failed too many times [{self._restart_attempts}]")
+        raise ConnectionTimeout(f"{self.name}: Connection failed within {CONNECT_BUDGET_SECONDS}s budget")
 
     # Connect
     async def connect(self):
-        """Connect to the blind."""
-        assert self._ble_device is not None
-        device = self._ble_device
+        """Connect to the blind.
+
+        Re-fetches the freshest connectable BLEDevice so establish_connection (and each of
+        its internal retries) routes through whichever proxy currently hears the blind
+        best, instead of pinning a possibly-stale device/proxy.
+        """
+        def _fresh_device():
+            return (
+                bluetooth.async_ble_device_from_address(
+                    self.hub._hass, self.host, connectable=True
+                )
+                or self._ble_device
+            )
+
+        device = _fresh_device()
+        if device is None:
+            self._last_connection_error = "no connectable BLEDevice available"
+            _LOGGER.debug("%s: No connectable BLEDevice to connect to", self.name)
+            return
+        self._ble_device = device
         try:
             client: BleakClientWithServiceCache = await establish_connection(
                 client_class=BleakClientWithServiceCache,
                 device=device,
                 name=self.host,
                 use_services_cache=True,
-                max_attempts=self._restart_attempts,
-                ble_device_callback=lambda: device,
+                max_attempts=1,
+                ble_device_callback=_fresh_device,
             )
             self._client = client
+            # Fresh connection has no notify subscription yet — force _ensure_notify() to
+            # re-subscribe on this new client (a drop+reconnect that bypassed disconnect()
+            # would otherwise leave _notify_active stale-True and silently skip subscribing).
+            self._notify_active = False
             # send the maintain connection message
             await self._client.write_gatt_char(UUID, bytes.fromhex(CONNECTION_MESSAGE))
 
@@ -263,28 +323,34 @@ class TuissBlind:
             return
         _LOGGER.debug("%s: Disconnecting", self.name)
         try:
-            try:
-                await client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
-            except Exception as notify_ex:
-                # Characteristic might not exist or notifications not started
-                _LOGGER.debug("%s: Could not stop notifications: %s", self.name, notify_ex)
-            await client.disconnect()
-        except BLEAK_RETRY_EXCEPTIONS as ex:
-            _LOGGER.warning(
-                "%s: Error disconnecting: %s",
-                self.name,
-                ex,
+            await asyncio.wait_for(
+                self._teardown_client(client), timeout=DISCONNECT_TIMEOUT_SECONDS
             )
-        else:
             _LOGGER.debug("%s: Disconnect completed successfully", self.name)
-            _LOGGER.debug(
-                "%s: Disconnect. Current Position: %s. Current Moving: %s",
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "%s: Disconnect timed out after %ss; dropping client reference",
                 self.name,
-                self._current_cover_position,
-                self._moving,
+                DISCONNECT_TIMEOUT_SECONDS,
             )
+        except BLEAK_RETRY_EXCEPTIONS as ex:
+            _LOGGER.warning("%s: Error disconnecting: %s", self.name, ex)
         finally:
+            # Always clear the client + notify state so ensure_connected()/_ensure_notify()
+            # start fresh next time rather than reusing a half-dead client/subscription.
+            self._client = None
+            self._notify_active = False
+            self._response_handler = None
             self._stopped_event.set()
+
+    async def _teardown_client(self, client) -> None:
+        """Stop notifications and disconnect a BLE client (helper for disconnect())."""
+        try:
+            await client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
+        except Exception as notify_ex:
+            # Characteristic might not exist or notifications not started
+            _LOGGER.debug("%s: Could not stop notifications: %s", self.name, notify_ex)
+        await client.disconnect()
 
     async def wait_for_stop(self):
         """Wait for the blind to stop moving."""
@@ -292,9 +358,101 @@ class TuissBlind:
         await self._stopped_event.wait()
         
     async def ensure_connected(self) -> None:
-        """Ensure the blind is connected before sending a command."""
-        if not self._client or not self._client.is_connected:
-            await self.attempt_connection()
+        """Ensure the blind is connected before sending a command.
+
+        Serialized via _conn_lock so a keep-awake re-grab and a user move can't both launch a
+        connection at once (concurrent connects to these one-connection motors cause
+        ESP_GATT_CONN_CANCEL). If another task connected while we waited, return early.
+        """
+        if self._client and self._client.is_connected:
+            return
+        async with self._conn_lock:
+            if not self._client or not self._client.is_connected:
+                await self.attempt_connection()
+
+    async def _hold_or_disconnect(self) -> None:
+        """End-of-operation teardown. For keep-awake blinds, HOLD the connection open (keeps
+        the motor awake and instantly controllable, like the phone app) instead of dropping it.
+        For all other blinds, disconnect exactly as before."""
+        if self._keep_awake and self._client and self._client.is_connected:
+            _LOGGER.debug("%s: keep-awake — holding connection open", self.name)
+            self._stopped_event.set()
+            return
+        await self.disconnect()
+
+    async def _dispatch_notify(self, sender, data) -> None:
+        """Single persistent notify handler; routes each response to the current operation."""
+        handler = self._response_handler
+        if handler is not None:
+            await handler(sender, data)
+
+    async def _ensure_notify(self) -> None:
+        """Subscribe to the blind's notify characteristic ONCE per connection and reuse it.
+
+        Re-subscribing on a held (keep-awake) connection was hanging set_position() for 30s;
+        instead we subscribe a single dispatcher and each operation swaps _response_handler.
+        """
+        if self._notify_active and self._client and self._client.is_connected:
+            return
+        assert self._client is not None
+        await asyncio.wait_for(
+            self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, self._dispatch_notify),
+            timeout=10.0,
+        )
+        self._notify_active = True
+
+    ##################################################################################################
+    ## KEEP-AWAKE (PERSISTENT CONNECTION) ###########################################################
+    ##################################################################################################
+
+    def start_keep_awake(self) -> None:
+        """Start the background loop that grabs and holds the connection for this blind."""
+        if not self._keep_awake or self._keep_awake_task:
+            return
+        _LOGGER.info("%s: starting keep-awake (persistent connection) loop", self.name)
+        self._keep_awake_task = self.hub._hass.async_create_task(self.keep_awake_loop())
+
+    def stop_keep_awake(self) -> None:
+        """Stop the keep-awake loop (on entity removal / unload)."""
+        if self._keep_awake_task:
+            self._keep_awake_task.cancel()
+            self._keep_awake_task = None
+
+    async def keep_awake_loop(self) -> None:
+        """Hold a persistent connection to keep this sleepy motor awake.
+
+        When disconnected, gently try to grab the connection (bounded, serialized). Once held,
+        just monitor it — holding the GATT link keeps the motor awake so moves are instant and
+        reliable. On drop, re-grab. Gentle retry cadence so an unreachable blind never storms
+        the Bluetooth stack.
+        """
+        # Small initial delay so entity setup / restore finishes first.
+        await asyncio.sleep(10)
+        while self._keep_awake:
+            try:
+                if not (self._client and self._client.is_connected):
+                    if self._locked:
+                        # A move is mid-flight and owns the connection lifecycle; wait.
+                        await asyncio.sleep(5)
+                        continue
+                    try:
+                        await self.ensure_connected()
+                    except Exception as e:  # noqa: BLE001  (ConnectionTimeout/DeviceNotFound/Bleak)
+                        _LOGGER.debug(
+                            "%s: keep-awake could not grab connection (%s); retrying in %ss",
+                            self.name, e, KEEP_AWAKE_RETRY_SECONDS,
+                        )
+                        await asyncio.sleep(KEEP_AWAKE_RETRY_SECONDS)
+                        continue
+                    if self._client and self._client.is_connected:
+                        _LOGGER.info("%s: keep-awake grabbed & now HOLDING the connection", self.name)
+                # Connected: hold and monitor.
+                await asyncio.sleep(KEEP_AWAKE_HOLD_POLL_SECONDS)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.debug("%s: keep-awake loop error: %s", self.name, e)
+                await asyncio.sleep(KEEP_AWAKE_RETRY_SECONDS)
 
     ##################################################################################################
     ## SET METHODS ###################################################################################
@@ -310,15 +468,9 @@ class TuissBlind:
             "%s: Attempting to set position to: %s", self.name, self._desired_position
         )
         command = bytes.fromhex(self.hex_convert(userPercent))
-        try:
-            await self._client.start_notify(
-                BLIND_NOTIFY_CHARACTERISTIC, self.set_position_callback
-            )
-        except BleakError:
-            await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
-            await self._client.start_notify(
-                BLIND_NOTIFY_CHARACTERISTIC, self.set_position_callback
-            )
+        # Reuse the single persistent notify subscription (no re-subscribe hang on held conn).
+        self._response_handler = self.set_position_callback
+        await self._ensure_notify()
         await self.send_command(UUID, command)  # send the command
 
     async def stop(self) -> None:
@@ -381,25 +533,16 @@ class TuissBlind:
         await self.ensure_connected()
 
         assert self._client is not None
-        notify_started = False
+        # Reuse the single persistent notify subscription and route responses to `callback`.
+        self._response_handler = callback
         try:
-            await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, callback)
-            notify_started = True
-        except BleakError as e:
-            _LOGGER.debug("%s: Failed to start notify: %s. Attempting to stop and restart.", self.name, e)
-            try:
-                # when need to overwrite the existing notification
-                await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
-                await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, callback)
-                notify_started = True
-            except BleakError as retry_error:
-                _LOGGER.warning("%s: Could not establish notifications: %s", self.name, retry_error)
-                # Characteristic may not exist or device disconnected; ensure cleanup
-                await self.disconnect()
-                return
+            await self._ensure_notify()
+        except Exception as e:  # noqa: BLE001
+            _LOGGER.warning("%s: Could not establish notifications: %s", self.name, e)
+            await self.disconnect()
+            return
 
-        # Only send command if we successfully started notifications and are still connected
-        if notify_started and self._client and self._client.is_connected:
+        if self._client and self._client.is_connected:
             try:
                 await self.send_command(UUID, command)
             except Exception as e:
@@ -408,17 +551,14 @@ class TuissBlind:
                 return
 
             # Wait for the response/callback to complete with timeout to prevent hanging
-            if self._client:
-                try:
-                    await asyncio.wait_for(self.wait_for_stop(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    _LOGGER.warning("%s: Timeout waiting for response in get_from_blind", self.name)
-                finally:
-                    await self.disconnect()
+            try:
+                await asyncio.wait_for(self.wait_for_stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                _LOGGER.warning("%s: Timeout waiting for response in get_from_blind", self.name)
+            finally:
+                await self._hold_or_disconnect()
         else:
-            # If we couldn't start notify, ensure we disconnect
-            if not notify_started:
-                await self.disconnect()
+            await self.disconnect()
                     
 
     async def get_battery_status(self) -> None:
@@ -583,24 +723,18 @@ class TuissBlind:
                 new_timer_id = str(decimals[6])
                 timer_id_event.set()
 
-        try:
-            await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, timer_id_callback)
-        except BleakError:
-            await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
-            await self._client.start_notify(BLIND_NOTIFY_CHARACTERISTIC, timer_id_callback)
+        self._response_handler = timer_id_callback
+        await self._ensure_notify()
 
-        await self.send_command(UUID, bytes.fromhex(CONNECTION_MESSAGE))   
-        await self.send_timestamp()   
-        await self.send_command(UUID, bytes.fromhex("ff78ea4104"))   
-        
+        await self.send_command(UUID, bytes.fromhex(CONNECTION_MESSAGE))
+        await self.send_timestamp()
+        await self.send_command(UUID, bytes.fromhex("ff78ea4104"))
+
         try:
             await asyncio.wait_for(timer_id_event.wait(), timeout=10.0)
         except asyncio.TimeoutError:
-            await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
             await self.disconnect()
             raise HomeAssistantError("Timeout waiting for timer ID from blind.")
-
-        await self._client.stop_notify(BLIND_NOTIFY_CHARACTERISTIC)
 
         _LOGGER.debug("Received timer ID from blind: %s", new_timer_id)
 
@@ -801,8 +935,12 @@ class TuissBlind:
             )
             try:
                 _LOGGER.debug("%s: Sending the command %s", self.name, command.hex())
-                await self._client.write_gatt_char(UUID, command)
-            except BleakError as e:
+                # Bound the GATT write so a flapping proxy can't hang it for 30s; the move's
+                # error path then unsticks quickly instead of stalling.
+                await asyncio.wait_for(
+                    self._client.write_gatt_char(UUID, command), timeout=12.0
+                )
+            except (BleakError, asyncio.TimeoutError) as e:
                 _LOGGER.error("%s: Send Command error: %s", self.name, e)
                 raise RuntimeError(e) from e
 
@@ -849,7 +987,7 @@ class TuissBlind:
         """Move the cover."""
         _LOGGER.debug("%s: Entering async_move_cover. Locked: %s", self.name, self._locked)
         if not self._locked:
-            await self.attempt_connection()
+            await self.ensure_connected()
             if self._client and self._client.is_connected:
                 self._locked = True
                 _LOGGER.debug("%s: Lock acquired.", self.name)
@@ -911,84 +1049,62 @@ class TuissBlind:
                     await self.disconnect()
                     return
                 
-                end_time = None
                 start_time = datetime.datetime.now()
 
-                async def aync_update_position_in_realtime():
-                    """Task to update the position while the blind is moving."""
-                    while self._client and self._client.is_connected and not self._is_stopping:
-                        if self._attr_traversal_speed is not None:
-                            _LOGGER.debug(
-                                "%s: StartPos: %s. CurrentPos: %s. TargetPos: %s. Timedelta: %s",
-                                self.name,
-                                start_position,
-                                self._current_cover_position,
-                                corrected_target_position,
-                                (datetime.datetime.now() - start_time).total_seconds(),
-                            )
-                            traversal_difference = (
-                                (datetime.datetime.now() - start_time).total_seconds()
-                                * self._attr_traversal_speed
-                                * movement_direction
-                            )
-                            self._current_cover_position = round(
-                                sorted([0, start_position + traversal_difference, 100])[1], 2
-                            )
-                            self.publish_updates()
-                            
-                        await asyncio.sleep(1)
-
-                update_task = self.hub._hass.async_create_task(aync_update_position_in_realtime())
+                # The state already shows opening/closing (self._moving set above). During the
+                # physical move the ESP32 shares its one radio between WiFi and BLE, so live
+                # position notifications often don't get through - and that's fine. We wait
+                # roughly the travel time (a "reached" notification, if it makes it, just ends
+                # the wait early), then read the TRUE final position once the radio is free.
+                # Joe's model: a reliable command + one truthful update when the move is done.
+                sp = start_position if start_position is not None else 0
+                distance = abs(corrected_target_position - sp)
+                if self._attr_traversal_speed is not None and 1 <= self._attr_traversal_speed < 6:
+                    travel_time = (distance * 1.2) / self._attr_traversal_speed + 6
+                else:
+                    travel_time = (distance / 100.0) * 45 + 6  # assume ~45s for a full travel
+                travel_time = min(max(travel_time, 6.0), float(TIMEOUT_SECONDS or 120))
 
                 try:
-                    # Calculate timeout based on traversal speed or use default
-                    if (self._attr_traversal_speed is not None and 
-                        self._attr_traversal_speed >= 1 and 
-                        self._attr_traversal_speed < 6):
-                        timeout_duration = ((abs(corrected_target_position - start_position) * 1.2) / self._attr_traversal_speed) + 10
-                    else:
-                        timeout_duration = TIMEOUT_SECONDS or 120
-                    
                     _LOGGER.debug(
-                        "%s: Waiting for stop event with timeout: %s seconds. Traversal speed: %s",
-                        self.name,
-                        timeout_duration,
-                        self._attr_traversal_speed,
+                        "%s: Move command sent; waiting up to %.0fs for travel.",
+                        self.name, travel_time,
                     )
-                    await asyncio.wait_for(self.wait_for_stop(), timeout=timeout_duration)
-                except asyncio.TimeoutError:
-                    _LOGGER.warning("%s: Timeout waiting for blind to stop", self.name)
-                    update_task.cancel()
-                    # await self.get_blind_position()
-                    await self.disconnect()
-                    self.set_final_state(corrected_target_position)
-                    _LOGGER.debug("%s: Lock released following timeout", self.name)
-                    self._locked = False
-                    return  # stops blind updating traversal speed if it timesout
+                    try:
+                        await asyncio.wait_for(self.wait_for_stop(), timeout=travel_time)
+                        _LOGGER.debug("%s: Move confirmed early by a live notification.", self.name)
+                    except asyncio.TimeoutError:
+                        _LOGGER.debug(
+                            "%s: Travel time elapsed with no live notification (normal for "
+                            "ESP32 WiFi/BLE coexistence); reading real position.", self.name,
+                        )
+
+                    self._moving = 0
+                    self.publish_updates()
+
+                    if not self._is_stopping:
+                        # Calibrate travel speed for better future estimates.
+                        self.update_traversal_speed(
+                            corrected_target_position, sp, start_time, datetime.datetime.now()
+                        )
+                        # Read and report the TRUE final position (the "update once it's done").
+                        try:
+                            await self.get_blind_position()
+                            _LOGGER.debug(
+                                "%s: Move complete. Real position: %s",
+                                self.name, self._current_cover_position,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            _LOGGER.debug(
+                                "%s: Post-move position read failed (%s); using target estimate.",
+                                self.name, e,
+                            )
+                            self.set_final_state(corrected_target_position)
                 finally:
-                    update_task.cancel()
-                    # Ensure disconnect is called in all cases
-                    await self.disconnect()
-                    # unlock the entity to allow more changes
+                    # Hold the connection for keep-awake blinds, otherwise disconnect as usual.
+                    await self._hold_or_disconnect()
                     self._locked = False
                     _LOGGER.debug("%s: Lock released in async_move_cover.", self.name)
-
-                # set the traversal speed average and update final states only if the blind has not been stopped, as that updates itself
-                _LOGGER.debug(
-                    "%s: Finished moving. StartPos: %s. CurrentPos: %s. TargetPos: %s. is_stopping: %s",
-                    self.name,
-                    start_position,
-                    self._current_cover_position,
-                    corrected_target_position,
-                    self._is_stopping,
-                )
-                if not self._is_stopping:
-                    end_time = datetime.datetime.now()
-                    self.update_traversal_speed(
-                        corrected_target_position, start_position, start_time, end_time
-                    )
-
-                    self.set_final_state(corrected_target_position)
 
         elif self._locked:
             _LOGGER.debug(

@@ -89,17 +89,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _LOGGER.debug("Getting the blind position for %s if %s set TRUE",blind.name, blind._position_on_restart)
 
         if blind._position_on_restart:
-            try:
-                # Add a timeout to prevent hanging indefinitely waiting for bluetooth response
-                await asyncio.wait_for(blind.get_blind_position(), timeout=15.0)
-            except asyncio.TimeoutError:
-                _LOGGER.warning("%s: Timeout getting blind position on startup. Retrying later.", blind.name)
-                raise ConfigEntryNotReady("Timeout getting blind position - retrying later") from None
-            except (DeviceNotFound, ConnectionTimeout) as e:
-                raise ConfigEntryNotReady("Cannot connect to blind") from e
-            except Exception as e:
-                _LOGGER.warning("%s: Error getting blind position on startup: %s. Retrying later.", blind.name, e)
-                raise ConfigEntryNotReady(f"Error getting blind position: {e}") from e
+            # Read the position in the BACKGROUND so a slow/failed BLE connect never blocks
+            # setup or triggers HA's ConfigEntryNotReady retry loop. The old blocking 15s
+            # read raised ConfigEntryNotReady on every failure, which made unreachable
+            # sleepy blinds (6 & 7) re-run setup - and hammer the shared BLE stack - every
+            # ~10 min forever. This is best-effort and self-heals on the next move/poll.
+            async def _startup_position_read(b=blind):
+                try:
+                    await b.get_blind_position()
+                    _LOGGER.debug("%s: Startup position read complete", b.name)
+                except Exception as e:  # noqa: BLE001
+                    _LOGGER.debug(
+                        "%s: Startup position read failed (will update on next move/poll): %s",
+                        b.name, e,
+                    )
+            hass.async_create_task(_startup_position_read())
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = hub
     entry.async_on_unload(entry.add_update_listener(update_listener))

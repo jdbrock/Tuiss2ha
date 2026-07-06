@@ -367,76 +367,70 @@ class Tuiss(CoverEntity, RestoreEntity):
             )
         if last_state and last_state.attributes.get(ATTR_TRAVERSAL_SPEED) is not None:
             self._blind._attr_traversal_speed = last_state.attributes.get(ATTR_TRAVERSAL_SPEED)
-        
+
         self._blind.register_callback(self.update_state)
+
+        # For keep-awake blinds, start the loop that grabs and HOLDS the BLE connection so the
+        # sleepy motor stays awake and instantly controllable (scoped by MAC in const.py).
+        self._blind.start_keep_awake()
 
 
     async def async_will_remove_from_hass(self) -> None:
         """Entity being removed from hass."""
+        self._blind.stop_keep_awake()
         self._blind.remove_callback(self.update_state)
 
 
+    async def _move_and_retry(self, ha_target: float, skip_battery_check: bool = False) -> None:
+        """Move to ha_target (0-100), retrying through transient proxy flaps until reached.
+
+        A single move over a flapping proxy can drop mid-flight; keep-awake re-grabs the
+        connection, so retrying the whole move usually lands it. Up to 3 attempts, then error.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            current = self._blind._current_cover_position
+            if current is None:
+                current = 0
+            movement_direction = 1 if current <= ha_target else -1
+            try:
+                await self._blind.async_move_cover(
+                    movement_direction=movement_direction,
+                    target_position=100 - ha_target,
+                    skip_battery_check=skip_battery_check,
+                )
+            except (ConnectionTimeout, DeviceNotFound) as e:
+                last_exc = e
+            pos = self._blind._current_cover_position
+            if pos is not None and abs(pos - ha_target) <= 3:
+                return  # reached target
+            if attempt < 2:
+                _LOGGER.debug(
+                    "%s: move to %s didn't land (at %s); retrying (%d/3)",
+                    self._attr_name, ha_target, pos, attempt + 2,
+                )
+                await asyncio.sleep(3)
+        _LOGGER.warning("%s: failed to reach %s after retries", self._attr_name, ha_target)
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key="failed_set_position",
+            translation_placeholders={
+                "name": self._attr_name,
+                "error": str(last_exc) if last_exc else "did not reach target",
+            })
+
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
-        try:
-            await self._blind.async_move_cover(movement_direction=1, target_position=0)
-        except (ConnectionTimeout, DeviceNotFound) as e:
-            _LOGGER.debug("%s failed to open with error %s.", self._attr_name, e)
-            # Use translation placeholder so the frontend can localise the message
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="failed_to_open",
-                translation_placeholders={
-                    "name": self._attr_name,
-                    "error": str(e),
-                })
-
+        await self._move_and_retry(100)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
         """Close the cover."""
-        try:
-            await self._blind.async_move_cover(movement_direction=-1, target_position=100)
-        except (ConnectionTimeout, DeviceNotFound) as e:
-            _LOGGER.debug("%s failed to close with error %s.", self._attr_name, e)
-            # Use translation placeholder so the frontend can localise the message
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="failed_to_close",
-                translation_placeholders={
-                    "name": self._attr_name,
-                    "error": str(e),
-                })
-        
-
+        await self._move_and_retry(0)
 
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         """Set the cover position."""
-        if self._blind._current_cover_position is None:
-            self._blind._current_cover_position = 0
-
-        if self._blind._current_cover_position <= kwargs[ATTR_POSITION]:
-            movement_direction = 1
-        else:
-            movement_direction = -1
-            
         skip_battery_check = kwargs.get("skip_battery_check", False)
-
-        try:
-            await self._blind.async_move_cover(
-                movement_direction=movement_direction,
-                target_position= 100 - kwargs[ATTR_POSITION],
-                skip_battery_check=skip_battery_check,
-            )
-        except (ConnectionTimeout, DeviceNotFound) as e:
-            _LOGGER.debug("%s failed to set position with error %s.", self._attr_name, e)
-            # Use translation placeholder so the frontend can localise the message
-            raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="failed_set_position",
-                translation_placeholders={
-                    "name": self._attr_name,
-                    "error": str(e),
-                })
+        await self._move_and_retry(kwargs[ATTR_POSITION], skip_battery_check=skip_battery_check)
 
 
 
