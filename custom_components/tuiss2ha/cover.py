@@ -326,7 +326,13 @@ class Tuiss(CoverEntity, RestoreEntity):
         """Return the current position of the cover."""
         if self._blind._current_cover_position is None:
             return None
-        return int(self._blind._current_cover_position)
+        pos = int(self._blind._current_cover_position)
+        # These blinds calibrate the top of travel a hair off and report 99 when fully open;
+        # snap it so HA shows a clean 100 fully-open state. (Closed end left alone: upstream
+        # treats position 1 as a valid open state.)
+        if pos >= 99:
+            return 100
+        return pos
 
     @property
     def is_closed(self) -> bool | None:
