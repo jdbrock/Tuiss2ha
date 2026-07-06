@@ -273,15 +273,18 @@ class Tuiss(CoverEntity, RestoreEntity):
 
     @property
     def state(self):
-        """Set state of object."""
+        """Open/closed/opening/closing — derived from the SNAPPED position so the status agrees
+        with the reported percentage, and None-safe so an unknown position can't crash setup."""
         if self._blind._moving > 0:
             self._state = STATE_OPENING
         elif self._blind._moving < 0:
             self._state = STATE_CLOSING
-        elif self._blind._moving == 0 and self._blind._current_cover_position >= 25:
-            self._state = STATE_OPEN
         else:
-            self._state = STATE_CLOSED
+            pos = self.current_cover_position          # snapped (99 -> 100)
+            if pos is None:
+                self._state = None
+            else:
+                self._state = STATE_CLOSED if pos == 0 else STATE_OPEN
         return self._state
         
     @property
@@ -336,10 +339,11 @@ class Tuiss(CoverEntity, RestoreEntity):
 
     @property
     def is_closed(self) -> bool | None:
-        """Return if the cover is closed or not."""
-        if self._blind._current_cover_position is None:
+        """Closed only when fully closed — derived from the SNAPPED position, None-safe."""
+        pos = self.current_cover_position
+        if pos is None:
             return None
-        return self._blind._current_cover_position == 0
+        return pos == 0
 
     @property
     def supported_features(self) -> CoverEntityFeature:
