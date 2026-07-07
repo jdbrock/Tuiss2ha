@@ -55,6 +55,12 @@ _LOGGER = logging.getLogger(__name__)
 ATTR_TRAVERSAL_SPEED = "traversal_speed"
 ATTR_MAC_ADDRESS = "mac_address"
 
+# Connect this many blinds at a time in the simultaneous-positioning service. Firing all connects at
+# once overwhelms the BT-proxy dongles — only a handful establish within the connect budget and the
+# rest time out (a 13-blind group open landed just 5). Connecting in small batches lands them all; the
+# established connections are held until every batch is up, then all blinds are moved together.
+SIMULTANEOUS_CONNECT_BATCH = 4
+
 GET_BLIND_POSITION_SCHEMA = cv.make_entity_service_schema({})
 SET_BLIND_POSITION_SCHEMA = cv.make_entity_service_schema(
     {vol.Required("position"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100))}
@@ -174,16 +180,22 @@ async def async_setup_entry(
             _LOGGER.error("No valid entities found for parallel blind position setting.")
             return
 
-        # Try to connect to all blinds in parallel, but continue on individual failures
-        connect_tasks = [asyncio.create_task(entity._blind.attempt_connection()) for entity in target_entities]
-        connect_results = await asyncio.gather(*connect_tasks, return_exceptions=True)
-
+        # Connect in small batches, not all at once — firing every connect simultaneously overwhelms
+        # the proxy dongles (only a few establish within the budget; the rest time out — a 13-blind
+        # open landed just 5). Batching lands them reliably; each batch's connections are held open
+        # until all batches are up, then every blind is moved together below (still synchronised).
         connected_entities: list[Tuiss] = []
-        for entity, res in zip(target_entities, connect_results):
-            if isinstance(res, Exception):
-                _LOGGER.warning("Failed to connect to %s: %s", entity.entity_id, res)
-            else:
-                connected_entities.append(entity)
+        for i in range(0, len(target_entities), SIMULTANEOUS_CONNECT_BATCH):
+            batch = target_entities[i:i + SIMULTANEOUS_CONNECT_BATCH]
+            batch_results = await asyncio.gather(
+                *(entity._blind.attempt_connection() for entity in batch),
+                return_exceptions=True,
+            )
+            for entity, res in zip(batch, batch_results):
+                if isinstance(res, Exception):
+                    _LOGGER.warning("Failed to connect to %s: %s", entity.entity_id, res)
+                else:
+                    connected_entities.append(entity)
 
         if not connected_entities:
             _LOGGER.error("No blinds connected for simultaneous positioning.")
