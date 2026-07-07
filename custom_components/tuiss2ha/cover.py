@@ -44,6 +44,7 @@ from .const import (
     DEFAULT_BATTERY_CHECK_DAYS,
     ConnectionTimeout,
     DeviceNotFound,
+    MoveAborted,
     CONFIRM_REREAD_DELAYS,
 )
 from .hub import TuissBlind
@@ -392,63 +393,95 @@ class Tuiss(CoverEntity, RestoreEntity):
         self._blind.remove_callback(self.update_state)
 
 
+    async def _preempted(self, seconds: float = 0.0) -> bool:
+        """True if a newer command has preempted this move (so the retry/re-read loop yields instead
+        of chasing the old target). Optionally waits up to `seconds`, returning the instant the
+        preemption arrives so a reverse/stop takes effect promptly rather than on a fixed boundary."""
+        if self._blind._abort_event.is_set():
+            return True
+        if seconds <= 0:
+            return False
+        try:
+            await asyncio.wait_for(self._blind._abort_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def _move_and_retry(self, ha_target: float, skip_battery_check: bool = False) -> None:
         """Move to ha_target (0-100), retrying through transient proxy flaps until reached.
 
-        A single move over a flapping proxy can drop mid-flight; keep-awake re-grabs the
-        connection, so retrying the whole move usually lands it. Up to 3 attempts, then error.
+        Serialized per blind by _move_lock so two moves never overlap, and preemptible via
+        _abort_event: a newer command (opposite move, re-target, or stop) aborts the in-flight move
+        cleanly and this loop YIELDS instead of chasing the superseded target. A single move over a
+        flapping proxy can still drop mid-flight; reconnect re-grabs the connection, so retrying the
+        whole move usually lands it. Up to 3 attempts, then error.
         """
-        last_exc: Exception | None = None
-        for attempt in range(3):
-            current = self._blind._current_cover_position
-            if current is None:
-                current = 0
-            movement_direction = 1 if current <= ha_target else -1
-            try:
-                await self._blind.async_move_cover(
-                    movement_direction=movement_direction,
-                    target_position=100 - ha_target,
-                    skip_battery_check=skip_battery_check,
-                )
-            except (ConnectionTimeout, DeviceNotFound) as e:
-                last_exc = e
+        # Signal any in-flight move for this blind to bail, then take the lock exclusively so nothing
+        # else moves this blind until we're done (or are ourselves preempted).
+        self._blind._abort_event.set()
+        async with self._blind._move_lock:
+            self._blind._abort_event.clear()
+            last_exc: Exception | None = None
             pos = self._blind._current_cover_position
-            if pos is not None and abs(pos - ha_target) <= 3:
-                return  # reached target
-            if attempt < 2:
-                _LOGGER.debug(
-                    "%s: move to %s didn't land (at %s); retrying (%d/3)",
-                    self._attr_name, ha_target, pos, attempt + 2,
-                )
-                await asyncio.sleep(3)
-        # Immediate retries didn't confirm arrival. The blind may well have physically reached the
-        # target but the position read-back was lost (common under multi-blind storm contention).
-        # Re-read the true position on a progressive schedule (~+2s, +5s, +10s) before declaring
-        # failure — so a successful-but-unconfirmed move self-heals fast instead of sitting stale
-        # until the 4-hourly poll. position_callback doesn't push state, so write it here.
-        _LOGGER.debug(
-            "%s: move to %s unconfirmed (at %s); re-reading position (waits %s)",
-            self._attr_name, ha_target, pos, CONFIRM_REREAD_DELAYS,
-        )
-        for wait in CONFIRM_REREAD_DELAYS:
-            await asyncio.sleep(wait)
-            try:
-                await self._blind.get_blind_position()
-            except (ConnectionTimeout, DeviceNotFound, RuntimeError) as e:
-                last_exc = e
-            self.async_write_ha_state()
-            pos = self._blind._current_cover_position
-            if pos is not None and abs(pos - ha_target) <= 3:
-                _LOGGER.debug("%s: confirmed at %s on re-read", self._attr_name, pos)
-                return
-        _LOGGER.warning("%s: failed to reach %s after retries + progressive re-reads", self._attr_name, ha_target)
-        raise HomeAssistantError(
-            translation_domain=DOMAIN,
-            translation_key="failed_set_position",
-            translation_placeholders={
-                "name": self._attr_name,
-                "error": str(last_exc) if last_exc else "did not reach target",
-            })
+            for attempt in range(3):
+                current = self._blind._current_cover_position
+                if current is None:
+                    current = 0
+                movement_direction = 1 if current <= ha_target else -1
+                try:
+                    await self._blind.async_move_cover(
+                        movement_direction=movement_direction,
+                        target_position=100 - ha_target,
+                        skip_battery_check=skip_battery_check,
+                    )
+                except MoveAborted:
+                    _LOGGER.debug("%s: superseded by a newer command; yielding", self._attr_name)
+                    return
+                except (ConnectionTimeout, DeviceNotFound) as e:
+                    last_exc = e
+                if await self._preempted():
+                    _LOGGER.debug("%s: superseded between attempts; yielding", self._attr_name)
+                    return
+                pos = self._blind._current_cover_position
+                if pos is not None and abs(pos - ha_target) <= 3:
+                    return  # reached target
+                if attempt < 2:
+                    _LOGGER.debug(
+                        "%s: move to %s didn't land (at %s); retrying (%d/3)",
+                        self._attr_name, ha_target, pos, attempt + 2,
+                    )
+                    if await self._preempted(3):
+                        _LOGGER.debug("%s: superseded during backoff; yielding", self._attr_name)
+                        return
+            # Immediate retries didn't confirm arrival. The blind may well have physically reached the
+            # target but the position read-back was lost (common under multi-blind storm contention).
+            # Re-read the true position on a progressive schedule (~+1s, +2s, +5s, +10s) before
+            # declaring failure — so a successful-but-unconfirmed move self-heals fast instead of
+            # sitting stale until the 4-hourly poll. position_callback doesn't push state, so write it.
+            _LOGGER.debug(
+                "%s: move to %s unconfirmed (at %s); re-reading position (waits %s)",
+                self._attr_name, ha_target, pos, CONFIRM_REREAD_DELAYS,
+            )
+            for wait in CONFIRM_REREAD_DELAYS:
+                if await self._preempted(wait):
+                    return
+                try:
+                    await self._blind.get_blind_position()
+                except (ConnectionTimeout, DeviceNotFound, RuntimeError) as e:
+                    last_exc = e
+                self.async_write_ha_state()
+                pos = self._blind._current_cover_position
+                if pos is not None and abs(pos - ha_target) <= 3:
+                    _LOGGER.debug("%s: confirmed at %s on re-read", self._attr_name, pos)
+                    return
+            _LOGGER.warning("%s: failed to reach %s after retries + progressive re-reads", self._attr_name, ha_target)
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="failed_set_position",
+                translation_placeholders={
+                    "name": self._attr_name,
+                    "error": str(last_exc) if last_exc else "did not reach target",
+                })
 
     async def async_open_cover(self, **kwargs: Any) -> None:
         """Open the cover."""
@@ -467,29 +500,35 @@ class Tuiss(CoverEntity, RestoreEntity):
 
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
-        """Stop the cover."""
-        _LOGGER.debug("%s: Entering async_stop_cover. is_stopping: %s", self.name, self._blind._is_stopping)
+        """Stop the cover — abort any in-flight move and halt at the current position.
+
+        Setting _abort_event breaks the in-flight move's travel wait so its retry YIELDS instead of
+        chasing the old target (a stop used to be silently undone by that retry re-firing the move),
+        and taking _move_lock ensures nothing else moves this blind while we halt it. The aborted
+        move leaves the live connection open, so stop() reuses it and halts immediately."""
+        _LOGGER.debug("%s: Entering async_stop_cover. moving: %s", self.name, self._blind._moving)
         self._blind._is_stopping = True
-        try:
-            await self._blind.stop()
-        except (ConnectionTimeout, DeviceNotFound, RuntimeError) as e:
-            if self._blind._moving != 0:
-                _LOGGER.debug("Failed to stop %s. Error %s", self._attr_name, e)
-                # Use translation placeholder so the frontend can localise the message
-                raise HomeAssistantError(
-                translation_domain=DOMAIN,
-                translation_key="failed_to_stop",
-                translation_placeholders={
-                    "name": self._attr_name,
-                    "error": str(e),
-                })
-        finally:
-            if self._blind._client:
-                # Re-check _client each loop: a disconnect (or the stop flow itself) can null it
-                # out mid-wait, and the bare None.is_connected was raising during stop_cover.
-                while self._blind._client and self._blind._client.is_connected:
-                    await asyncio.sleep(1)
+        self._blind._abort_event.set()
+        async with self._blind._move_lock:
+            self._blind._abort_event.clear()
+            try:
+                await self._blind.stop()
+            except (ConnectionTimeout, DeviceNotFound, RuntimeError) as e:
+                if self._blind._moving != 0:
+                    _LOGGER.debug("Failed to stop %s. Error %s", self._attr_name, e)
+                    # Use translation placeholder so the frontend can localise the message
+                    raise HomeAssistantError(
+                        translation_domain=DOMAIN,
+                        translation_key="failed_to_stop",
+                        translation_placeholders={
+                            "name": self._attr_name,
+                            "error": str(e),
+                        })
+            finally:
                 self._blind._moving = 0
+                self._blind._is_stopping = False
+                if self._blind._client:
+                    await self._blind.disconnect()
+                self._blind._locked = False
                 await self.async_scheduled_update_request()
-            _LOGGER.debug("%s: Lock released in async_stop_cover.", self._attr_name)
-            self._blind._locked = False
+                _LOGGER.debug("%s: stop complete; blind halted.", self._attr_name)

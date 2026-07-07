@@ -94,3 +94,8 @@ class ConnectionTimeout(Exception):
 
 class NoConnectableBluetoothAdapter(Exception):
     """Error to indicate no Bluetooth adapter can connect (e.g. Shelly is passive-only)."""
+
+
+class MoveAborted(Exception):
+    """Raised inside a move when a newer command (an opposite move, a re-target, or a stop) preempts
+    it — so the retry loop yields to the new intent instead of re-firing the superseded target."""

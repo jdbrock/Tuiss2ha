@@ -31,6 +31,7 @@ from .const import (
     DEFAULT_RESTART_ATTEMPTS,
     DeviceNotFound,
     ConnectionTimeout,
+    MoveAborted,
     NoConnectableBluetoothAdapter,
     TIMEOUT_SECONDS,
     CONNECT_BUDGET_SECONDS,
@@ -98,6 +99,8 @@ class TuissBlind:
         self._moving = 0
         self._is_stopping = False
         self._stopped_event = asyncio.Event()
+        self._abort_event = asyncio.Event()   # set to preempt an in-flight move (reverse / re-target / stop)
+        self._move_lock = asyncio.Lock()      # true mutex: only one move per blind runs at a time
         self._current_cover_position: float | None = None
         self._desired_position: int | None = None
         self._desired_orientation = False
@@ -1109,15 +1112,33 @@ class TuissBlind:
                     travel_time = (distance / 100.0) * 45 + 6  # assume ~45s for a full travel
                 travel_time = min(max(travel_time, 6.0), float(TIMEOUT_SECONDS or 120))
 
+                aborted = False
                 try:
                     _LOGGER.debug(
                         "%s: Move command sent; waiting up to %.0fs for travel.",
                         self.name, travel_time,
                     )
-                    try:
-                        await asyncio.wait_for(self.wait_for_stop(), timeout=travel_time)
+                    # Wait for the travel to finish OR for a newer command (an opposite move, a
+                    # re-target, or a stop) to preempt us. Racing wait_for_stop against _abort_event
+                    # is what lets "open while it's closing" reverse and "stop" halt, instead of
+                    # finishing the wrong way first.
+                    stop_t = asyncio.ensure_future(self.wait_for_stop())
+                    abort_t = asyncio.ensure_future(self._abort_event.wait())
+                    done, pending = await asyncio.wait(
+                        {stop_t, abort_t}, timeout=travel_time,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    if abort_t in done:
+                        aborted = True
+                        _LOGGER.debug("%s: preempted mid-flight — yielding to newer command.", self.name)
+                        raise MoveAborted(self.name)
+                    if stop_t in done:
                         _LOGGER.debug("%s: Move confirmed early by a live notification.", self.name)
-                    except asyncio.TimeoutError:
+                    else:
                         _LOGGER.debug(
                             "%s: Travel time elapsed with no live notification (normal for "
                             "ESP32 WiFi/BLE coexistence); reading real position.", self.name,
@@ -1145,10 +1166,16 @@ class TuissBlind:
                             )
                             self.set_final_state(corrected_target_position)
                 finally:
-                    # Hold the connection for keep-awake blinds, otherwise disconnect as usual.
-                    await self._hold_or_disconnect()
                     self._locked = False
-                    _LOGGER.debug("%s: Lock released in async_move_cover.", self.name)
+                    if aborted:
+                        # Leave _moving and the live connection intact — the preempting command
+                        # (reverse move or stop) reuses the connection and sets the new state, which
+                        # is what makes a reversal instant rather than a disconnect/reconnect.
+                        _LOGGER.debug("%s: Lock released (preempted); connection held for successor.", self.name)
+                    else:
+                        # Hold the connection for keep-awake blinds, otherwise disconnect as usual.
+                        await self._hold_or_disconnect()
+                        _LOGGER.debug("%s: Lock released in async_move_cover.", self.name)
 
         elif self._locked:
             _LOGGER.debug(
