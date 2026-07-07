@@ -36,6 +36,7 @@ from .const import (
     CONNECT_BUDGET_SECONDS,
     PER_ATTEMPT_CONNECT_TIMEOUT,
     DISCONNECT_TIMEOUT_SECONDS,
+    LOCK_WAIT_SECONDS,
     KEEP_AWAKE_HOSTS,
     KEEP_AWAKE_RETRY_SECONDS,
     KEEP_AWAKE_HOLD_POLL_SECONDS,
@@ -1018,6 +1019,17 @@ class TuissBlind:
     ):
         """Move the cover."""
         _LOGGER.debug("%s: Entering async_move_cover. Locked: %s", self.name, self._locked)
+        # A previous op (e.g. this blind's close, immediately before a group open) may still be
+        # releasing its lock. Poll-wait briefly for it rather than failing "busy" and bouncing into
+        # the 3s-backoff retry — which is what made one blind in a group move start seconds after
+        # the rest. We proceed the instant it clears.
+        if self._locked:
+            waited = 0.0
+            while self._locked and waited < LOCK_WAIT_SECONDS:
+                await asyncio.sleep(0.1)
+                waited += 0.1
+            if not self._locked:
+                _LOGGER.debug("%s: prior lock cleared after %.1fs; proceeding", self.name, waited)
         if not self._locked:
             await self.ensure_connected()
             if self._client and self._client.is_connected:

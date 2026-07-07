@@ -44,6 +44,12 @@ KEEP_AWAKE_HOLD_POLL_SECONDS = 15  # how often the hold loop checks the connecti
 # attempts land at roughly +1s, +2s, +5s, +10s — quick first try, backing off. Early success returns
 # immediately (a re-read's own connect/read time adds on top).
 CONFIRM_REREAD_DELAYS = (1, 1, 3, 5)
+
+# If a move is requested while the blind is still finishing a previous one (a close immediately
+# followed by an open of a group), wait up to this long for its lock to release before giving up
+# with "busy" — otherwise the move bounces into the 3s-backoff retry and starts seconds after the
+# rest of the group. Polled, so it proceeds the instant the previous op releases.
+LOCK_WAIT_SECONDS = 12.0
 BLIND_NOTIFY_CHARACTERISTIC = "00010304-0405-0607-0809-0a0b0c0d1910"
 CONNECTION_MESSAGE = "ff03030303787878787878"
 INITIALIZATION_MESSAGE = "ff78ea41d10301"
