@@ -98,6 +98,7 @@ class TuissBlind:
         self._moving = 0
         self._is_stopping = False
         self._stopped_event = asyncio.Event()
+        self._abort_event = asyncio.Event()   # set to break an in-flight move so an opposite one can reverse it
         self._current_cover_position: float | None = None
         self._desired_position: int | None = None
         self._desired_orientation = False
@@ -1019,10 +1020,16 @@ class TuissBlind:
     ):
         """Move the cover."""
         _LOGGER.debug("%s: Entering async_move_cover. Locked: %s", self.name, self._locked)
-        # A previous op (e.g. this blind's close, immediately before a group open) may still be
-        # releasing its lock. Poll-wait briefly for it rather than failing "busy" and bouncing into
-        # the 3s-backoff retry — which is what made one blind in a group move start seconds after
-        # the rest. We proceed the instant it clears.
+        # Reverse-on-opposite: if a move is in flight in the OPPOSITE direction, abort it so we can
+        # turn around straight away (intuitive — hit open while it's closing and it reverses),
+        # instead of waiting for it to finish or failing "busy". The abort breaks the in-flight
+        # move's travel wait; it releases its lock, and the poll-wait below hands control to us.
+        if self._locked and self._moving != 0 and self._moving != movement_direction:
+            _LOGGER.debug("%s: opposite move requested mid-flight — aborting to reverse", self.name)
+            self._abort_event.set()
+        # A previous op (this blind's close just before a group open, or the abort above) may still
+        # be releasing its lock. Poll-wait briefly rather than failing "busy" and bouncing into the
+        # 3s-backoff retry — which made one blind in a group move start seconds after the rest.
         if self._locked:
             waited = 0.0
             while self._locked and waited < LOCK_WAIT_SECONDS:
@@ -1034,6 +1041,7 @@ class TuissBlind:
             await self.ensure_connected()
             if self._client and self._client.is_connected:
                 self._locked = True
+                self._abort_event.clear()   # fresh move — a stale abort flag must not cancel us
                 _LOGGER.debug("%s: Lock acquired.", self.name)
                 self._is_stopping = False
                 start_position = self._current_cover_position
@@ -1114,10 +1122,24 @@ class TuissBlind:
                         "%s: Move command sent; waiting up to %.0fs for travel.",
                         self.name, travel_time,
                     )
-                    try:
-                        await asyncio.wait_for(self.wait_for_stop(), timeout=travel_time)
+                    stop_t = asyncio.ensure_future(self.wait_for_stop())
+                    abort_t = asyncio.ensure_future(self._abort_event.wait())
+                    done, pending = await asyncio.wait(
+                        {stop_t, abort_t}, timeout=travel_time,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    if abort_t in done:
+                        # An opposite move asked us to reverse — bail out fast, skip the final read,
+                        # and let it take over (it clears the abort flag when it acquires the lock).
+                        self._is_stopping = True
+                        _LOGGER.debug("%s: move aborted to reverse", self.name)
+                    elif stop_t in done:
                         _LOGGER.debug("%s: Move confirmed early by a live notification.", self.name)
-                    except asyncio.TimeoutError:
+                    else:
                         _LOGGER.debug(
                             "%s: Travel time elapsed with no live notification (normal for "
                             "ESP32 WiFi/BLE coexistence); reading real position.", self.name,
