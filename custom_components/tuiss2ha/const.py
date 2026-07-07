@@ -39,9 +39,11 @@ KEEP_AWAKE_RETRY_SECONDS = 240   # gentle re-grab interval while the blind is un
 KEEP_AWAKE_HOLD_POLL_SECONDS = 15  # how often the hold loop checks the connection is alive
 
 # After a move whose final position wasn't confirmed (read-back lost under multi-blind storm
-# contention), wait this long for the BLE stack to settle, then re-read the true position once so
-# HA self-heals immediately instead of sitting stale until the next scheduled 4-hourly poll.
-CONFIRM_REREAD_DELAY = 10
+# contention), re-read the true position on a PROGRESSIVE schedule so HA self-heals fast instead of
+# sitting stale until the next 4-hourly poll. These are the waits BEFORE each re-read attempt, so
+# attempts land at roughly +2s, +5s, +10s — quick first try, backing off. Early success returns
+# immediately (a re-read's own connect/read time adds on top).
+CONFIRM_REREAD_DELAYS = (2, 3, 5)
 BLIND_NOTIFY_CHARACTERISTIC = "00010304-0405-0607-0809-0a0b0c0d1910"
 CONNECTION_MESSAGE = "ff03030303787878787878"
 INITIALIZATION_MESSAGE = "ff78ea41d10301"
