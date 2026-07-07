@@ -410,7 +410,14 @@ class TuissBlind:
         if not self._keep_awake or self._keep_awake_task:
             return
         _LOGGER.info("%s: starting keep-awake (persistent connection) loop", self.name)
-        self._keep_awake_task = self.hub._hass.async_create_task(self.keep_awake_loop())
+        # MUST be a background task, not async_create_task: keep_awake_loop() runs forever, and a
+        # task registered via async_create_task is awaited by HA's startup block-till-done. An
+        # infinite loop there stalls bootstrap until HA's 300s setup timeout fires — that was the
+        # ~5-min slow-restart. Background tasks aren't awaited at startup, so keep-awake keeps
+        # holding the connection without blocking boot.
+        self._keep_awake_task = self.hub._hass.async_create_background_task(
+            self.keep_awake_loop(), f"tuiss2ha keep-awake {self.name}"
+        )
 
     def stop_keep_awake(self) -> None:
         """Stop the keep-awake loop (on entity removal / unload)."""
