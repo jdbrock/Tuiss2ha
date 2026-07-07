@@ -44,6 +44,7 @@ from .const import (
     DEFAULT_BATTERY_CHECK_DAYS,
     ConnectionTimeout,
     DeviceNotFound,
+    CONFIRM_REREAD_DELAY,
 )
 from .hub import TuissBlind
 
@@ -420,7 +421,26 @@ class Tuiss(CoverEntity, RestoreEntity):
                     self._attr_name, ha_target, pos, attempt + 2,
                 )
                 await asyncio.sleep(3)
-        _LOGGER.warning("%s: failed to reach %s after retries", self._attr_name, ha_target)
+        # Immediate retries didn't confirm arrival. The blind may well have physically reached the
+        # target but the position read-back was lost (common under multi-blind storm contention).
+        # Give the BLE stack a few seconds to settle, then re-read the true position ONCE before
+        # declaring failure — so a successful-but-unconfirmed move self-heals now instead of sitting
+        # stale until the 4-hourly poll. position_callback doesn't push state, so write it here.
+        _LOGGER.debug(
+            "%s: move to %s unconfirmed (at %s); settling %ss then re-reading position",
+            self._attr_name, ha_target, pos, CONFIRM_REREAD_DELAY,
+        )
+        await asyncio.sleep(CONFIRM_REREAD_DELAY)
+        try:
+            await self._blind.get_blind_position()
+        except (ConnectionTimeout, DeviceNotFound, RuntimeError) as e:
+            last_exc = e
+        self.async_write_ha_state()
+        pos = self._blind._current_cover_position
+        if pos is not None and abs(pos - ha_target) <= 3:
+            _LOGGER.debug("%s: confirmed at %s on settle re-read", self._attr_name, pos)
+            return
+        _LOGGER.warning("%s: failed to reach %s after retries + settle re-read", self._attr_name, ha_target)
         raise HomeAssistantError(
             translation_domain=DOMAIN,
             translation_key="failed_set_position",
