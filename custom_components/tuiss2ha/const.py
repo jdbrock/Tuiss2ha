@@ -30,7 +30,11 @@ DISCONNECT_TIMEOUT_SECONDS = 8
 # the ESP32 proxies can't reliably wake them on demand, so for chosen blinds HA grabs and HOLDS
 # the connection (exactly like the phone app) to keep the motor awake and instantly controllable.
 # Scoped by MAC so it can ONLY ever affect the listed blind(s) — never the others.
-KEEP_AWAKE_HOSTS = ["C0:16:2C:5E:66:A0"]  # guinea pig: Living Room Blind 10 (Patio Right)
+# Empty = keep-awake disabled. Holding a persistent BLE connection was a workaround for flaky
+# connects, but the Linux proxy + discovery-guard + auto-recovery made reconnect-on-command
+# reliable, while a held connection drains the motor battery and occupies a scarce proxy slot.
+# Add a MAC here only to deliberately force-hold one high-use blind awake for instant response.
+KEEP_AWAKE_HOSTS = []
 KEEP_AWAKE_RETRY_SECONDS = 240   # gentle re-grab interval while the blind is unreachable
 KEEP_AWAKE_HOLD_POLL_SECONDS = 15  # how often the hold loop checks the connection is alive
 BLIND_NOTIFY_CHARACTERISTIC = "00010304-0405-0607-0809-0a0b0c0d1910"
