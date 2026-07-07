@@ -464,7 +464,9 @@ class Tuiss(CoverEntity, RestoreEntity):
                 })
         finally:
             if self._blind._client:
-                while self._blind._client.is_connected:
+                # Re-check _client each loop: a disconnect (or the stop flow itself) can null it
+                # out mid-wait, and the bare None.is_connected was raising during stop_cover.
+                while self._blind._client and self._blind._client.is_connected:
                     await asyncio.sleep(1)
                 self._blind._moving = 0
                 await self.async_scheduled_update_request()
