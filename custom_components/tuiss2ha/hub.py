@@ -284,6 +284,31 @@ class TuissBlind:
                 max_attempts=1,
                 ble_device_callback=_fresh_device,
             )
+            # Self-heal a poisoned GATT cache: if the notify characteristic is missing, an earlier
+            # incomplete discovery (e.g. an mtu=23 connect under storm contention) got cached, and
+            # every move would fail with "characteristic ... not found" until an HA restart. Clear
+            # the cache and re-discover ONCE with a fresh connection so it recovers on its own.
+            if client.services.get_characteristic(BLIND_NOTIFY_CHARACTERISTIC) is None:
+                _LOGGER.warning(
+                    "%s: notify characteristic missing after connect (poisoned GATT cache); "
+                    "clearing cache and re-discovering", self.name,
+                )
+                try:
+                    await client.clear_cache()
+                except Exception as e:  # noqa: BLE001
+                    _LOGGER.debug("%s: clear_cache failed: %s", self.name, e)
+                try:
+                    await client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
+                client = await establish_connection(
+                    client_class=BleakClientWithServiceCache,
+                    device=_fresh_device() or device,
+                    name=self.host,
+                    use_services_cache=False,  # force a fresh discovery this time
+                    max_attempts=1,
+                    ble_device_callback=_fresh_device,
+                )
             self._client = client
             # Fresh connection has no notify subscription yet — force _ensure_notify() to
             # re-subscribe on this new client (a drop+reconnect that bypassed disconnect()
