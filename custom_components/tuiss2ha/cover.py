@@ -55,15 +55,6 @@ _LOGGER = logging.getLogger(__name__)
 ATTR_TRAVERSAL_SPEED = "traversal_speed"
 ATTR_MAC_ADDRESS = "mac_address"
 
-# Move blinds this many at a time in the simultaneous-positioning service, staggering each batch's
-# connect burst. Firing all 13 connects at once — OR connecting all then moving — stalls at ~5 blinds:
-# holding idle BLE connections open blocks the BT-proxy dongles from establishing more (each blind
-# connects fine on its own). Small move-and-release batches land them all.
-SIMULTANEOUS_CONNECT_BATCH = 4
-# Seconds between batches — long enough for a batch to connect and start moving (connections active,
-# not idle-blocking) before the next batch's connect burst. ~matches the manual wave that landed 13/13.
-SIMULTANEOUS_BATCH_STAGGER = 20
-
 GET_BLIND_POSITION_SCHEMA = cv.make_entity_service_schema({})
 SET_BLIND_POSITION_SCHEMA = cv.make_entity_service_schema(
     {vol.Required("position"): vol.All(vol.Coerce(float), vol.Range(min=0, max=100))}
@@ -183,37 +174,41 @@ async def async_setup_entry(
             _LOGGER.error("No valid entities found for parallel blind position setting.")
             return
 
-        # Move in small STAGGERED batches. Holding idle BLE connections open blocks the BT-proxy
-        # dongles from establishing more — an all-at-once fire, OR connecting all then moving, stalls
-        # at ~5 of 13 even though each blind connects fine alone. Instead each move connects, travels,
-        # then disconnects; we fire a batch, wait for it to get connecting/moving (so its connections
-        # are active rather than idle-blocking), then fire the next. Moves run concurrently, so blinds
-        # travel together within a batch and largely overlap across batches. Proven: lands all 13
-        # where all-at-once lands 5. (Each move handles its own connection + retry/failure.)
-        move_tasks: list[tuple[Tuiss, asyncio.Task]] = []
-        total = len(target_entities)
-        for i in range(0, total, SIMULTANEOUS_CONNECT_BATCH):
-            batch = target_entities[i:i + SIMULTANEOUS_CONNECT_BATCH]
-            for entity in batch:
-                if favourite:
-                    tgt = entity.config_entry.options.get(OPT_FAVORITE_POSITION, DEFAULT_FAVORITE_POSITION)
-                else:
-                    tgt = position
-                move_tasks.append((
-                    entity,
-                    asyncio.create_task(
-                        entity.async_set_cover_position(**{ATTR_POSITION: tgt, "skip_battery_check": True})
-                    ),
-                ))
-            # Stagger the next batch's connect burst (not after the last batch).
-            if i + SIMULTANEOUS_CONNECT_BATCH < total:
-                await asyncio.sleep(SIMULTANEOUS_BATCH_STAGGER)
+        # Try to connect to all blinds in parallel, but continue on individual failures
+        connect_tasks = [asyncio.create_task(entity._blind.attempt_connection()) for entity in target_entities]
+        connect_results = await asyncio.gather(*connect_tasks, return_exceptions=True)
 
-        for entity, task in move_tasks:
-            try:
-                await task
-            except Exception as e:  # noqa: BLE001
-                _LOGGER.warning("Failed to set position for %s: %s", entity.entity_id, e)
+        connected_entities: list[Tuiss] = []
+        for entity, res in zip(target_entities, connect_results):
+            if isinstance(res, Exception):
+                _LOGGER.warning("Failed to connect to %s: %s", entity.entity_id, res)
+            else:
+                connected_entities.append(entity)
+
+        if not connected_entities:
+            _LOGGER.error("No blinds connected for simultaneous positioning.")
+            return
+
+        # Build and dispatch set-position tasks
+        set_position_tasks = []
+        if favourite:
+            for entity in connected_entities:
+                fav_pos = entity.config_entry.options.get(
+                    OPT_FAVORITE_POSITION, DEFAULT_FAVORITE_POSITION
+                )
+                set_position_tasks.append(
+                    entity.async_set_cover_position(**{ATTR_POSITION: fav_pos, "skip_battery_check": True})
+                )
+        else:
+            for entity in connected_entities:
+                set_position_tasks.append(
+                    entity.async_set_cover_position(**{ATTR_POSITION: position, "skip_battery_check": True})
+                )
+
+        results = await asyncio.gather(*set_position_tasks, return_exceptions=True)
+        for entity, res in zip(connected_entities, results):
+            if isinstance(res, Exception):
+                _LOGGER.warning("Failed to set position for %s: %s", entity.entity_id, res)
 
     hass.services.async_register(
         DOMAIN,
